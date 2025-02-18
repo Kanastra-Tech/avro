@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"sync"
 	"unsafe"
 )
 
@@ -12,6 +13,12 @@ const (
 	maxIntBufSize  = 5
 	maxLongBufSize = 10
 )
+
+var byteSlicePool = sync.Pool{
+	New: func() interface{} {
+		return make([]byte, 1024) // Buffer inicial de 1KB
+	},
+}
 
 // ReaderFunc is a function used to customize the Reader.
 type ReaderFunc func(r *Reader)
@@ -285,28 +292,37 @@ func (r *Reader) readBytes(op string) []byte {
 		return nil
 	}
 	if size == 0 {
-		return []byte{}
+		return nil
 	}
-	if maxSize := r.cfg.getMaxByteSliceSize(); maxSize > 0 && size > maxSize {
+
+	// Verifica limites configurados para evitar estouro de memória
+	if max := r.cfg.getMaxByteSliceSize(); max > 0 && size > max {
 		fnName := "Read" + strings.ToTitle(op)
 		r.ReportError(fnName, "size is greater than `Config.MaxByteSliceSize`")
 		return nil
 	}
 
-	// The bytes are entirely in the buffer and of a reasonable size.
-	// Use the byte slab.
-	if r.head+size <= r.tail && size <= 1024 {
-		if cap(r.slab) < size {
-			r.slab = make([]byte, 1024)
-		}
-		dst := r.slab[:size]
-		r.slab = r.slab[size:]
-		copy(dst, r.buf[r.head:r.head+size])
+	// Caso o buffer já contenha os bytes e o tamanho seja pequeno, evita copiar
+	if r.head+size <= r.tail {
+		dst := r.buf[r.head : r.head+size]
 		r.head += size
 		return dst
 	}
 
-	buf := make([]byte, size)
+	// Usa um buffer reutilizável do sync.Pool se o tamanho for grande
+	var buf []byte
+	if size > 1024 {
+		buf = make([]byte, size) // Evita usar sync.Pool para grandes buffers
+	} else {
+		buf = byteSlicePool.Get().([]byte)
+		if cap(buf) < size {
+			buf = make([]byte, size)
+		} else {
+			buf = buf[:size]
+		}
+		defer byteSlicePool.Put(buf[:0]) // Devolve ao pool após o uso
+	}
+
 	r.Read(buf)
 	return buf
 }
